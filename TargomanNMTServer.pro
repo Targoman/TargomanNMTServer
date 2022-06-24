@@ -15,4 +15,4 @@ SOURCES = src/main.cpp
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 LIBS += -Llibmarian/lib -lmarian
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
-INCLUDEPATH += libmarian/include libmarian/include/3rd_party
+INCLUDEPATH += libmarian/include libmarian/include/marian libmarian/include/marian/3rd_party
