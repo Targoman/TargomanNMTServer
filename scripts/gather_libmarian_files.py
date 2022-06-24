@@ -19,5 +19,4 @@ print('Copying the libraries ...')
 target_path = os.path.join(nmt_server_path, 'libmarian/lib')
 os.makedirs(target_path, exist_ok=True)
 for static_lib_file in glob(f'{marian_path}/build/**/*.a', recursive=True):
-    print(static_lib_file)
     shutil.copy2(static_lib_file, target_path)
