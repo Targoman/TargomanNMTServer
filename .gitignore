@@ -1,3 +1,9 @@
+# Project specific
+.qmake.stash
+Makefile
+out
+libmarian
+
 # Prerequisites
 *.d
 
