@@ -12,4 +12,7 @@ include($$QBUILD_PATH/templates/appConfigs.pri)
 HEADERS =
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 SOURCES = src/main.cpp
-
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
+LIBS += -Llibmarian/lib -lmarian
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
+INCLUDEPATH += libmarian/include libmarian/include/3rd_party
