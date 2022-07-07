@@ -11,8 +11,23 @@ include($$QBUILD_PATH/templates/appConfigs.pri)
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 HEADERS =
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
-SOURCES = src/main.cpp
+SOURCES = \
+    src/main.cpp
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
-LIBS += -Llibmarian/lib -lmarian
+LIBS += \
+    -Llibmarian/lib\
+    -lmarian\
+    -levent\
+    -lfbgemm\
+    -lasmjit\
+    -lclog\
+    -lcpuinfo_internals\
+    -lcpuinfo\
+    -lintgemm\
+    -lsentencepiece\
+    -lsentencepiece_train\
+    -lrt
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 INCLUDEPATH += libmarian/include libmarian/include/marian libmarian/include/marian/3rd_party
+# +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
+QMAKE_CXXFLAGS += -Wno-unknown-pragmas

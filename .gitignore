@@ -1,4 +1,5 @@
 # Project specific
+.vscode
 .qmake.stash
 Makefile
 out
