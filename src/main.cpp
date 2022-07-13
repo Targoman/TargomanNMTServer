@@ -1,14 +1,628 @@
+#include <algorithm>
+#include <future>
+#include <map>
+#include <memory>
+#include <regex>
+#include "bpe.h"
+#include "gason.h"
 #pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-value"
+#include <marian/common/logging.h>
+#include <marian/common/utils.h>
+#include <marian/data/batch_generator.h>
+#include <marian/data/corpus.h>
+#include <marian/data/dataset.h>
+#include <marian/data/shortlist.h>
+#include <marian/data/text_input.h>
+#include <marian/data/types.h>
 #include <marian/marian.h>
-#include <marian/common/config_parser.h>
+#include <marian/translator/beam_search.h>
 #pragma GCC diagnostic pop
-
 #include "server.h"
+#include "./debug.h"
 
-int main(void) {
-    clsNmtServer server("0.0.0.0", 8080);
-    return 0;
+using namespace marian;
+
+#define EXTRA_DEBUG(body) if(CommandLineOptions->get<bool>("extra-debug", false)) { body }
+
+typedef std::pair<std::vector<std::string>, std::vector<int>> InputLines_t;
+const std::regex gLineEnderRegEx(" [\\.\\?\\!] ");
+InputLines_t getTextLines(const clsSimpleRestRequest& _request) {
+  InputLines_t Result;
+  Json::JsonValue Value;
+  Json::JsonAllocator Allocator;
+
+  std::string Body = _request.getBody();
+  LOG(info, "[rest-server] Request with BODY\n{}\n", Body);
+  char* EndPtr;
+  int status = Json::jsonParse(const_cast<char*>(Body.c_str()), &EndPtr, &Value, Allocator);
+  if(status != Json::JSON_OK)
+    throw std::runtime_error("Input is not a valid JSON string.");
+  if(Value.getTag() != Json::JSON_ARRAY)
+    throw std::runtime_error("Input string must be a JSON array.");
+  int LineIndex = 0;
+  for(auto Elem : Value) {
+    if(Elem->value.getTag() != Json::JSON_OBJECT)
+      throw std::runtime_error(
+          "Each element of the input array must be an object containing `src` field.");
+    std::string Src;
+    for(auto i : Elem->value) {
+      if(strcmp(i->key, "src") == 0) {
+        if(i->value.getTag() != Json::JSON_STRING)
+          throw std::runtime_error("`src` field must contain string.");
+        Src = i->value.toString();
+      }
+    }
+    int i = 0;
+    std::smatch LineEnderMatch;
+    while(std::regex_search(Src, LineEnderMatch, gLineEnderRegEx)) {
+      int j = LineEnderMatch.position() + 2;
+      if(j > i) {
+        Result.first.push_back(Src.substr(i, j - i));
+        Result.second.push_back(LineIndex);
+      }
+      Src = LineEnderMatch.suffix();
+    }
+    if(Src.size()) {
+      Result.first.push_back(Src);
+      Result.second.push_back(LineIndex);
+    }
+    ++LineIndex;
+  }
+
+  return Result;
+}
+
+typedef std::vector<std::vector<float>> Matrix_t;
+typedef std::pair<std::vector<std::string>, Matrix_t> TranslationResult_t;
+typedef std::pair<std::vector<std::string>, std::vector<TranslationResult_t>> TranslateFuncResult_t;
+
+class TextTokensInput;
+
+class TextTokensIterator : public IteratorFacade<TextTokensIterator, data::SentenceTuple const> {
+public:
+  TextTokensIterator() : pos_(-1), tup_(0) {}
+  explicit TextTokensIterator(TextTokensInput& corpus);
+
+private:
+  void increment() override;
+
+  bool equal(TextTokensIterator const& other) const override {
+    return this->pos_ == other.pos_ || (this->tup_.empty() && other.tup_.empty());
+  }
+
+  const data::SentenceTuple& dereference() const override { return tup_; }
+
+  TextTokensInput* corpus_;
+
+  long long int pos_;
+  data::SentenceTuple tup_;
+};
+
+class TextTokensInput
+    : public data::DatasetBase<data::SentenceTuple, TextTokensIterator, data::CorpusBatch> {
+private:
+  std::vector<std::vector<Word>> lines_;
+  std::vector<Ptr<Vocab>> vocabs_;
+
+  size_t pos_{0};
+
+public:
+  typedef data::SentenceTuple Sample;
+
+  TextTokensInput(std::vector<std::vector<Word>> inputs,
+                  std::vector<Ptr<Vocab>> vocabs,
+                  Ptr<Options> options)
+      : DatasetBase({"./dummy.stream"}, options), lines_(inputs), vocabs_(vocabs) {}
+
+  Sample next() override {
+    if(pos_ < lines_.size()) {
+      size_t curId = pos_++;
+      // fill up the sentence tuple with sentences from all input files
+      data::SentenceTuple tup(curId);
+      Words words = lines_[curId];
+      if(words.empty())
+        words.push_back(Word::fromWordIndex(0));
+      tup.push_back(words);
+      return tup;
+    }
+    return data::SentenceTuple(0);
+  }
+
+  void shuffle() override {}
+  void reset() override {}
+
+  iterator begin() override { return iterator(*this); }
+  iterator end() override { return iterator(); }
+
+  // TODO: There are half dozen functions called toBatch(), which are very
+  // similar. Factor them.
+  batch_ptr toBatch(const std::vector<Sample>& batchVector) override {
+    size_t batchSize = batchVector.size();
+
+    std::vector<size_t> sentenceIds;
+
+    std::vector<int> maxDims;
+    for(auto& ex : batchVector) {
+      if(maxDims.size() < ex.size())
+        maxDims.resize(ex.size(), 0);
+      for(size_t i = 0; i < ex.size(); ++i) {
+        if(ex[i].size() > (size_t)maxDims[i])
+          maxDims[i] = (int)ex[i].size();
+      }
+      sentenceIds.push_back(ex.getId());
+    }
+
+    std::vector<Ptr<data::SubBatch>> subBatches;
+    for(size_t j = 0; j < maxDims.size(); ++j) {
+      subBatches.emplace_back(New<data::SubBatch>(batchSize, maxDims[j], vocabs_[j]));
+    }
+
+    std::vector<size_t> words(maxDims.size(), 0);
+    for(size_t i = 0; i < batchSize; ++i) {
+      for(size_t j = 0; j < maxDims.size(); ++j) {
+        for(size_t k = 0; k < batchVector[i][j].size(); ++k) {
+          subBatches[j]->data()[k * batchSize + i] = batchVector[i][j][k];
+          subBatches[j]->mask()[k * batchSize + i] = 1.f;
+          words[j]++;
+        }
+      }
+    }
+
+    for(size_t j = 0; j < maxDims.size(); ++j)
+      subBatches[j]->setWords(words[j]);
+
+    auto batch = batch_ptr(new batch_type(subBatches));
+    batch->setSentenceIds(sentenceIds);
+
+    return batch;
+  }
+
+  void prepare() override {}
+};
+
+TextTokensIterator::TextTokensIterator(TextTokensInput& corpus)
+    : corpus_(&corpus), pos_(0), tup_(corpus_->next()) {}
+void TextTokensIterator::increment() {
+  tup_ = corpus_->next();
+  pos_++;
+}
+
+class clsOutputCollector {
+public:
+  clsOutputCollector() : MaxId(-1){};
+  clsOutputCollector(const clsOutputCollector&) = delete;
+
+  void add(long _sourceId,
+           const std::vector<std::string>& _sentence,
+           const std::vector<TranslationResult_t>& _translation) {
+    std::lock_guard<std::mutex> Lock(this->Mutex);
+    this->Outputs[_sourceId] = std::make_pair(_sentence, _translation);
+    if(this->MaxId <= _sourceId)
+      this->MaxId = _sourceId;
+  }
+  std::vector<TranslateFuncResult_t> collect() {
+    std::vector<TranslateFuncResult_t> Result;
+    for(int Id = 0; Id <= this->MaxId; ++Id)
+      Result.emplace_back(this->Outputs[Id]);
+    return Result;
+  }
+
+protected:
+  long MaxId;
+  std::mutex Mutex;
+
+  typedef std::map<long, TranslateFuncResult_t> Outputs_t;
+  Outputs_t Outputs;
+};
+
+template <class Search>
+class TranslateService {
+private:
+  Ptr<Options> options_;
+  std::vector<Ptr<ExpressionGraph>> graphs_;
+  std::vector<std::vector<Ptr<Scorer>>> scorers_;
+
+  std::vector<Ptr<Vocab>> srcVocabs_;
+  Ptr<Vocab> trgVocab_;
+
+  size_t numDevices_;
+  Ptr<BPE> bpe_;
+
+  std::vector<DeviceId> devices;
+
+  Ptr<ThreadPool> threadPool_;
+  std::atomic_long batchId;  
+
+public:
+  virtual ~TranslateService() {}
+
+  TranslateService(Ptr<Options> options) : options_(options) { init(); }
+
+  std::vector<TranslationResult_t> convertToTranslationResultVector(
+      const Ptr<History>& _history,
+      const std::vector<int>& _wordIndexes,
+      size_t _wordCount) {
+    auto NBest = _history->nBest(SIZE_MAX);
+    std::vector<TranslationResult_t> Result;
+    for(const auto& Item : NBest) {
+      Words OutputWordVocabIds;
+      IPtr<Hypothesis> Hypothesis;
+      float Score;
+      std::tie(OutputWordVocabIds, Hypothesis, Score) = Item;
+      std::vector<std::string> OutputWordsBpe(OutputWordVocabIds.size() - 1);
+      EXTRA_DEBUG(std::cout << "Getting BPE words ..." << std::endl;)
+      for(size_t i = 0; i < OutputWordVocabIds.size() - 1; ++i)
+        OutputWordsBpe[i] = this->trgVocab_->operator[](OutputWordVocabIds[i]);
+
+      std::vector<int> OutputWordIndexes;
+      std::vector<std::string> OutputWords;
+
+      EXTRA_DEBUG(std::cout << "Decoding BPE ..." << std::endl;)
+      std::tie(OutputWordIndexes, OutputWords) = this->bpe_->Decode(OutputWordsBpe);
+      EXTRA_DEBUG(std::cout << "Getting soft alignment ...  " << _wordCount << ":" << OutputWordIndexes.size() << std::endl;)
+      data::SoftAlignment RawAlignment = Hypothesis->tracebackAlignment();
+      EXTRA_DEBUG(std::cout << "Converting soft alignment ... " << RawAlignment.size() << "x" << RawAlignment[0].size() <<  std::endl;)
+      for(size_t i = 0; i < OutputWordIndexes.size(); ++i)
+          std::cout << OutputWordIndexes[i] << ",";
+      std::cout << std::endl;
+      data::SoftAlignment Alignment(OutputWords.size());
+      for(size_t i = 0; i < OutputWords.size(); ++i) {
+        Alignment[i].resize(_wordCount);
+        for(size_t j = 0; j < _wordCount; ++j)
+          Alignment[i][j] = 0;
+      }
+      EXTRA_DEBUG(std::cout << "Alignment: " << Alignment.size() << "x" << Alignment[0].size() << std::endl;)
+      for(size_t i = 0; i < OutputWordIndexes.size(); ++i) {
+        auto k = OutputWordIndexes[i];
+        for(size_t j = 0; j < _wordIndexes.size(); ++j) {
+          auto l = _wordIndexes[j];
+	  EXTRA_DEBUG(std::cout << "k,l <= i, j ... " << k << "," << l << " <= " << i << "," << j << std::endl;)
+          Alignment[k][l] += RawAlignment[i][j];
+        }
+      }
+      EXTRA_DEBUG(std::cout << "Emplacing result item ..." << std::endl;)
+
+      Result.emplace_back(std::make_pair(OutputWords, Alignment));
+    }
+    EXTRA_DEBUG(std::cout << "Returining all results!" << std::endl;)
+    return Result;
+  }
+
+  std::vector<std::string> tokenizeSource(const std::string _sentence) {
+    auto WordIndexes = this->srcVocabs_[0]->encode(_sentence, false, true);
+    std::vector<std::string> Words(WordIndexes.size());
+    std::transform(WordIndexes.begin(), WordIndexes.end(), Words.begin(), [&](const IndexType& e) {
+      return this->srcVocabs_[0]->operator[](Word::fromWordIndex(e));
+    });
+    return Words;
+  }
+
+  void init() {
+    // initialize vocabs
+
+    this->bpe_ = New<BPE>(options_->get<std::string>("bpe_file"), "@@");
+
+    auto vocabPaths = options_->get<std::vector<std::string>>("vocabs");
+    std::vector<int> maxVocabs = options_->get<std::vector<int>>("dim-vocabs");
+
+    for(size_t i = 0; i < vocabPaths.size() - 1; ++i) {
+      Ptr<Vocab> vocab = New<Vocab>(options_, i);
+      vocab->load(vocabPaths[i], maxVocabs[i]);
+      srcVocabs_.emplace_back(vocab);
+    }
+
+    trgVocab_ = New<Vocab>(options_, vocabPaths.size() - 1);
+    trgVocab_->load(vocabPaths.back());
+
+    // get device IDs
+    devices = Config::getDevices(options_);
+    numDevices_ = devices.size();
+
+    this->threadPool_ = New<ThreadPool>(numDevices_, numDevices_);
+    this->batchId = 0;
+
+    // initialize scorers
+    for(auto device : devices) {
+      auto graph = New<ExpressionGraph>(true);
+      graph->setDevice(device);
+      graph->getBackend()->setClip(options_->get<float>("clip-gemm"));
+      graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
+      graphs_.push_back(graph);
+
+      auto scorers = createScorers(options_);
+      for(auto scorer : scorers)
+        scorer->init(graph);
+      scorers_.push_back(scorers);
+    }
+  }
+
+  std::vector<TranslateFuncResult_t> run(const std::vector<std::string> inputs) {
+    std::vector<std::vector<std::string>> WordStrs;
+    std::vector<std::vector<Word>> Words;
+    std::vector<std::vector<int>> WordIndexes;
+    EXTRA_DEBUG(std::cout << "Applying BPE ..." << std::endl;)
+    for(const auto& Line : inputs) {
+      std::vector<std::string> LineTokens;
+      utils::split(Line, LineTokens, " ");
+      std::vector<Word> LineWords;
+      std::vector<int> LineWordIndexes;
+      for(size_t TokenIndex = 0; TokenIndex < LineTokens.size(); ++TokenIndex) {
+        const auto& Token = LineTokens[TokenIndex];
+        auto Parts = this->bpe_->Encode(Token);
+        for(const auto& Part : Parts) {
+          auto Word_ = this->srcVocabs_[0]->operator[](Part);
+          LineWords.push_back(Word_);
+          LineWordIndexes.push_back(TokenIndex);
+        }
+      }
+      LineWords.push_back(this->srcVocabs_[0]->getEosId());
+      WordStrs.emplace_back(LineTokens);
+      Words.emplace_back(LineWords);
+      WordIndexes.emplace_back(LineWordIndexes);
+    }
+    EXTRA_DEBUG(std::cout << "Applying BPE Done." << std::endl;)
+
+    auto corpus_ = New<TextTokensInput>(Words, srcVocabs_, options_);
+    data::BatchGenerator<TextTokensInput> batchGenerator(corpus_, options_);
+
+    auto collector = New<clsOutputCollector>();
+
+    batchGenerator.prepare();
+
+    std::vector<std::future<void>> taskResults;
+    for(auto batch : batchGenerator) {
+      auto task = [=](size_t id) {
+        thread_local Ptr<ExpressionGraph> graph;
+        thread_local std::vector<Ptr<Scorer>> scorers;
+
+        if(!graph) {
+          graph = graphs_[id % numDevices_];
+          scorers = scorers_[id % numDevices_];
+        }
+
+        EXTRA_DEBUG(std::cout << "Creating search ..." << std::endl;)
+        auto search = New<Search>(options_, scorers, trgVocab_);
+        EXTRA_DEBUG(std::cout << "Searching ..." << std::endl;)
+        auto histories = search->search(graph, batch);
+        EXTRA_DEBUG(std::cout << "Search done." << std::endl;)
+
+        for(auto history : histories) {
+          long id = (long)history->getLineNum();
+          EXTRA_DEBUG(std::cout << "Gathering history (" << id << ")" << std::endl;)
+          collector->add(id,
+                         WordStrs.at(id),
+                         this->convertToTranslationResultVector(
+                             history, WordIndexes.at(id), WordStrs.at(id).size()));
+          EXTRA_DEBUG(std::cout << "Gathering history (" << id << ") done." << std::endl;)
+        }
+        EXTRA_DEBUG(std::cout << "Task (" << id << ") done." << std::endl;)
+      };
+
+      taskResults.emplace_back(threadPool_->enqueue(task, (size_t)batchId));
+      batchId++;
+    }
+    for(auto& f : taskResults)
+        f.wait();
+
+    return collector->collect();
+  }
+};
+
+typedef std::tuple<std::vector<std::string>,
+                   std::vector<std::vector<std::string>>,
+                   std::vector<std::vector<int>>>
+    OutputItem_t;
+
+const std::vector<std::string> STOPWORDS = {"به",
+                                            "در",
+                                            "از",
+                                            "با",
+                                            "تا",
+                                            "که",
+                                            "را"
+                                            "to",
+                                            "in",
+                                            "from",
+                                            "with",
+                                            "the"};
+
+std::vector<int> getWordMapping(const Matrix_t& _softAlignmentMatrix,
+                                const std::vector<std::string>& _sourceTokens,
+                                const std::vector<std::string>& _targetTokens) {
+  size_t n = _softAlignmentMatrix.size();     // Target length
+  size_t m = _softAlignmentMatrix[0].size();  // Source length
+
+  Matrix_t M = _softAlignmentMatrix;
+
+  for(size_t i = 0; i < n; ++i) {
+    if(std::find(STOPWORDS.begin(), STOPWORDS.end(), _targetTokens[i]) != STOPWORDS.end()) {
+      for(size_t j = 0; j < m; ++j)
+        if(M[i][j] > 0.15) {
+          M[i][j] = 0;
+        }
+    }
+  }
+  for(size_t j = 0; j < m; ++j) {
+    if(std::find(STOPWORDS.begin(), STOPWORDS.end(), _sourceTokens[j]) != STOPWORDS.end()) {
+      for(size_t i = 0; i < n; ++i)
+        if(M[i][j] > 0.15) {
+          M[i][j] = 0;
+        }
+    }
+  }
+  std::vector<int> Result(n);
+  for(size_t i = 0; i < n; ++i) {
+    int MaxIndex = 0;
+    float Max = M[i][0];
+    for(size_t j = 1; j < m; ++j)
+      if(Max < M[i][j]) {
+        Max = M[i][j];
+        MaxIndex = j;
+      }
+    Result[i] = MaxIndex;
+  }
+  return Result;
+}
+
+OutputItem_t convertTranslationToOutputItem(
+    const std::vector<std::string>& _sourceTokens,
+    const std::vector<TranslationResult_t>& _translationResult) {
+  const std::vector<std::string>& BestTranslation = _translationResult[0].first;
+  const std::vector<int> WordMapping
+      = getWordMapping(_translationResult[0].second, _sourceTokens, BestTranslation);
+
+  std::vector<std::vector<std::string>> Phrases;
+  std::vector<std::vector<int>> Alignments;
+
+  size_t PhraseCount = 0;
+  size_t LastSourceIndex = (size_t)-1;
+  for(size_t TargetIndex = 0; TargetIndex < WordMapping.size(); ++TargetIndex) {
+    std::string TargetWord = BestTranslation[TargetIndex];
+    size_t SourceIndex = WordMapping[TargetIndex];
+    if(TargetWord == DEFAULT_UNK_STR) {
+      TargetWord = _sourceTokens[SourceIndex];
+    }
+    if(SourceIndex == LastSourceIndex) {
+      Phrases[PhraseCount - 1][0] += std::string(" ") + TargetWord;
+    } else {
+      Phrases.push_back({TargetWord});
+      Alignments.push_back({(int)SourceIndex});
+      ++PhraseCount;
+    }
+    LastSourceIndex = SourceIndex;
+  }
+
+  for(size_t NBestIndex = 1; NBestIndex < _translationResult.size(); ++NBestIndex) {
+    const std::vector<std::string>& TranslationCandidate = _translationResult[NBestIndex].first;
+    std::vector<int> WordMapping = getWordMapping(
+        _translationResult[NBestIndex].second, _sourceTokens, TranslationCandidate);
+
+    size_t LastSourceIndex = (size_t)-1;
+    std::vector<std::string> CandidatesBySource;
+    CandidatesBySource.resize(_sourceTokens.size());
+    for(size_t TargetIndex = 0; TargetIndex < WordMapping.size(); ++TargetIndex) {
+      auto TargetWord = TranslationCandidate[TargetIndex];
+      size_t SourceIndex = WordMapping[TargetIndex];
+      if(TargetWord == DEFAULT_UNK_STR) {
+        TargetWord = _sourceTokens[SourceIndex];
+      }
+      if(CandidatesBySource[SourceIndex].size() > 0) {
+        if(SourceIndex == LastSourceIndex)
+          CandidatesBySource[SourceIndex] += std::string(" ") + TargetWord;
+      } else {
+        CandidatesBySource[SourceIndex] = TargetWord;
+      }
+      LastSourceIndex = SourceIndex;
+    }
+
+    for(size_t PhraseIndex = 0; PhraseIndex < Phrases.size(); ++PhraseIndex) {
+      size_t SourceIndex = Alignments[PhraseIndex][0];
+      std::vector<std::string>& Candidates = Phrases[PhraseIndex];
+      bool Found = false;
+      for(size_t CandidateIndex = 0; CandidateIndex < Candidates.size(); ++CandidateIndex)
+        if(Candidates[CandidateIndex] == CandidatesBySource[SourceIndex]) {
+          Found = true;
+          break;
+        }
+      if(Found == false) {
+        Candidates.push_back(CandidatesBySource[SourceIndex]);
+      }
+    }
+  }
+
+  return std::make_tuple(_sourceTokens, Phrases, Alignments);
+}
+
+void mergeToPreviousOutputItem(OutputItem_t& _item, const OutputItem_t& _secondItem) {
+  std::vector<std::string> SourceTokens;
+  std::vector<std::vector<std::string>> Phrases;
+  std::vector<std::vector<int>> Alignments;
+
+  std::tie(SourceTokens, Phrases, Alignments) = _item;
+
+  std::vector<std::string> ExtSourceTokens;
+  std::vector<std::vector<std::string>> ExtPhrases;
+  std::vector<std::vector<int>> ExtAlignments;
+
+  std::tie(ExtSourceTokens, ExtPhrases, ExtAlignments) = _secondItem;
+
+  int SourceOffset = SourceTokens.size();
+  // int TargetOffset = Phrases.size();
+  for(const auto& Word : ExtSourceTokens)
+    SourceTokens.push_back(Word);
+  for(const auto& Phrase : ExtPhrases)
+    Phrases.push_back(Phrase);
+  for(const auto& A : ExtAlignments) {
+    std::vector<int> UpdatedAlignments;
+    for(auto a : A)
+      UpdatedAlignments.push_back(a + SourceOffset);
+    Alignments.push_back(UpdatedAlignments);
+  }
+}
+
+int main(int argc, char* argv[]) {
+  CommandLineOptions =  parseOptions(argc, argv, cli::mode::translation, true);
+
+  auto& Options = CommandLineOptions;
+  Options->set("inference", true);
+  Options->set("n-best", true);
+  Options->set("alignment", "soft");
+  Options->set("allow-unk", true);
+
+  const std::string ServerName;
+
+  TranslateService<BeamSearch> TranslationService(Options);
+
+  clsSimpleRestServer Server("0.0.0.0", 8080, 16);
+  Server.setCallback([&](const clsSimpleRestRequest& _request, clsSimpleRestResponse& _response) {
+    std::vector<std::string> Sentences;
+    std::vector<int> LineNumbers;
+    std::tie(Sentences, LineNumbers) = getTextLines(_request);
+    auto RawResults = TranslationService.run(Sentences);
+
+    std::vector<OutputItem_t> Result;
+    int PreviousLineNumber = -1;
+    for(size_t Dummy = 0; Dummy < RawResults.size(); ++Dummy) {
+      std::vector<std::string> SourceTokens;
+      std::vector<TranslationResult_t> NBestTranslations;
+      std::tie(SourceTokens, NBestTranslations) = RawResults[Dummy];
+      if(NBestTranslations.size() > 0) {
+        OutputItem_t Item = convertTranslationToOutputItem(SourceTokens, NBestTranslations);
+        if(PreviousLineNumber == LineNumbers[Dummy])
+          mergeToPreviousOutputItem(Result[Result.size() - 1], Item);
+        else
+          Result.push_back(Item);
+      } else {
+        Result.push_back(std::make_tuple(std::vector<std::string>(),
+                                         std::vector<std::vector<std::string>>(),
+                                         std::vector<std::vector<int>>()));
+      }
+      PreviousLineNumber = LineNumbers[Dummy];
+    }
+
+    _response << "{\"rslt\":[";
+    bool First = true;
+    for(const auto& Item : Result) {
+      std::vector<std::string> SourceTokens;
+      std::vector<std::vector<std::string>> Phrases;
+      std::vector<std::vector<int>> Alignments;
+      std::tie(SourceTokens, Phrases, Alignments) = Item;
+      if(First)
+        _response << "{";
+      else
+        _response << ",{";
+      _response << "\"tokens\":" << SourceTokens << ",";
+      _response << "\"phrases\":" << Phrases << ",";
+      _response << "\"alignments\":" << Alignments << "}";
+      First = false;
+    }
+    _response << "],\"serverName\":" << ServerName << "}";
+    _response.send();
+    LOG(info, "[rest server] Request answered.");
+  });
+  Server.start();
+  return 0;
 }

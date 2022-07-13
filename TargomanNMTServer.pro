@@ -12,6 +12,9 @@ include($$QBUILD_PATH/templates/appConfigs.pri)
 HEADERS =
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 SOURCES = \
+    src/bpe.cpp \
+    src/gason.cpp \
+    src/server.cpp \
     src/main.cpp
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 LIBS += \

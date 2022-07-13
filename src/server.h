@@ -1,157 +1,120 @@
 #include <evhttp.h>
-#include <iostream>
 #include <atomic>
+#include <functional>
+#include <string>
 #include <thread>
-#include <nlohmann/json.hpp>
+#include <vector>
 
-#include "helpers.h"
-
-class clsNmtResponse {
+class clsSimpleRestRequest {
 private:
-    evhttp_request* request;
-    evbuffer* buffer;
-    int statusCode_;
-public:
-    clsNmtResponse(evhttp_request* _request) : request(_request) {
-        this->buffer = evhttp_request_get_output_buffer(_request);
-    }
+  evhttp_request *Request;
 
 public:
-    int statusCode() const { return this->statusCode_; };
-    void setStatusCode(int _code) { this->statusCode_ = _code; }
+  clsSimpleRestRequest(evhttp_request *_request) {
+      this->Request = _request;
+  };
 
-    clsNmtResponse& operator << (const nlohmann::json& _json) {
-        auto j = _json.dump();
-        evbuffer_add(this->buffer, j.data(), j.size());
-        return *this;
-    }
+  evhttp_cmd_type getCommand() const { return evhttp_request_get_command(this->Request); }
+  std::string getBody() const {
+    evbuffer *Buf = evhttp_request_get_input_buffer(this->Request);
+    size_t Len = evbuffer_get_length(Buf);
+    std::string Result;
+    Result.resize(Len);
+    evbuffer_copyout(Buf, (void *)Result.data(), Len);
+    return Result;
+  }
 };
 
-class clsNmtRequest {
+class clsSimpleRestResponse {
 private:
-    evhttp_request* request;
-    clsNmtResponse response_;
+  evhttp_request *Request;
+  evbuffer *OutBuffer;
 
 public:
-    clsNmtRequest(evhttp_request* _request) :
-        request(_request),
-        response_(clsNmtResponse(_request))
-    {}
+  clsSimpleRestResponse(evhttp_request *_request) {
+      this->Request = _request;
+      this->OutBuffer = evhttp_request_get_output_buffer(_request);
+  };
 
-public:
-    evhttp_cmd_type command() const {
-        return evhttp_request_get_command(this->request);
+  clsSimpleRestResponse &operator<<(const char *_value) {
+    evbuffer_add_printf(this->OutBuffer, "%s", _value);
+    return *this;
+  }
+
+  clsSimpleRestResponse &operator<<(const char _value) {
+    evbuffer_add_printf(this->OutBuffer, "%c", _value);
+    return *this;
+  }
+
+  clsSimpleRestResponse &operator<<(const int _value) {
+    evbuffer_add_printf(this->OutBuffer, "%d", _value);
+    return *this;
+  }
+
+  clsSimpleRestResponse &operator<<(const float _value) {
+    evbuffer_add_printf(this->OutBuffer, "%f", _value);
+    return *this;
+  }
+
+  clsSimpleRestResponse &operator<<(const std::string &_value) { return (*this << '"' << _value.c_str() << '"'); }
+
+  template<typename T>
+  clsSimpleRestResponse &operator<<(const std::vector<T>& _value) {
+    evbuffer_add_printf(this->OutBuffer, "[");
+    if(_value.size() > 0) {
+        this->operator<< (_value[0]);
+        for(size_t i = 1; i < _value.size(); ++i) {
+            evbuffer_add_printf(this->OutBuffer, ",");
+            this->operator<< (_value[i]);
+        }
     }
+    evbuffer_add_printf(this->OutBuffer, "]");
+    return *this;
+  }
 
-    nlohmann::json postBodyAsJson() const {
-        auto buf = evhttp_request_get_input_buffer(this->request);
-        auto len = evbuffer_get_length(buf);
-        std::string rawJson;
-        rawJson.resize(len);
-        evbuffer_copyout(buf, const_cast<char*>(rawJson.data()), len);
-        return nlohmann::json::parse(rawJson);
-    }
 
-    clsNmtResponse& response() { return this->response_; }
+  void send(int _code = HTTP_OK) { evhttp_send_reply(this->Request, _code, "", this->OutBuffer); }
 };
 
-class clsNmtServer {
+typedef std::function<void(const clsSimpleRestRequest &, clsSimpleRestResponse &)>
+    SimpleRestServerCallback_t;
+
+class clsSimpleRestServer {
 private:
-    std::vector<std::unique_ptr<std::thread>> threads;
-    std::atomic_bool stopped;
+  std::string Address;
+  uint16_t Port;
+  int ThreadCount;
 
-    typedef std::unique_ptr<event_base, decltype(&event_base_free)> EventBasePtr_t;
-    EventBasePtr_t newEventBase() {
-        return EventBasePtr_t(event_base_new(), &event_base_free);
+  SimpleRestServerCallback_t Callback;
+
+  void sendErrorResponse(clsSimpleRestResponse &_response, const char *_what) {
+    _response << _what;
+    _response.send(HTTP_INTERNAL);
+  }
+
+  void handleRequest(evhttp_request *_request) {
+    const clsSimpleRestRequest Request(_request);
+    clsSimpleRestResponse Response(_request);
+    try {
+      this->Callback(Request, Response);
+    } catch(const std::exception &e) {
+      this->sendErrorResponse(Response, e.what());
+    } catch(...) {
+      this->sendErrorResponse(Response, "Unknown exception occurred.");
     }
-
-    typedef std::unique_ptr<evhttp, decltype(&evhttp_free)> EvHttpPtr_t;
-    EvHttpPtr_t newEvHttp(EventBasePtr_t& _eventBase) {
-        return EvHttpPtr_t(evhttp_new(_eventBase.get()), &evhttp_free);
-    }
-
-    static void __handleRequest(evhttp_request *_request, void *_this_) {
-        if(_request == nullptr)
-            return;
-        clsNmtServer* _this = static_cast<clsNmtServer*>(_this_);
-        _this->handleRequest(std::move(clsNmtRequest(_request)));
-    }
-
-    void handleRequest(clsNmtRequest&& _request) {
-        if(_request.command() != EVHTTP_REQ_POST) {
-            nlohmann::json result = {
-                {"code", 405},
-                {"msg", "Method not allowed."}
-            };
-            _request.response() << result;
-            return;
-        }
-        auto json = _request.postBodyAsJson();
-
-    }
+  }
 
 public:
-    clsNmtServer(const std::string& _address, int _port) {
-        std::cout << "ASDASDASD" << std::endl;
-        evutil_socket_t socket = -1;
-        unsigned int threadCount = std::thread::hardware_concurrency() - 1;
-        
-        std::exception_ptr initializationException;
+  clsSimpleRestServer(const char *_address, uint16_t _port, int _threadCount) {
+    this->Address = _address;
+    this->Port = _port;
+    this->ThreadCount = _threadCount;
+  }
 
-        for(size_t index = 0; index < threadCount; ++index) {
-            std::cout << "Starting thread#" << index << std::endl;
-            std::unique_ptr<std::thread> newThread(
-                new std::thread(
-                    [&] () {
-                        try {
-                            std::cout << "A" << std::endl;
-                            auto eventBase = this->newEventBase();
-                            if(!eventBase)
-                                throw std::runtime_error("Failed to create a new event base.");
-                            std::cout << "B" << std::endl;
-                            auto evHttp = this->newEvHttp(eventBase);
-                            if(!evHttp)
-                                throw std::runtime_error("Failed to create a new http event handler.");
-                            std::cout << "C" << std::endl;
-                            evhttp_set_gencb(
-                                evHttp.get(),
-                                clsNmtServer::__handleRequest,
-                                this
-                            );
-                            std::cout << "D" << std::endl;
-                            if(socket == -1) {
-                                auto boundSocket = evhttp_bind_socket_with_handle(
-                                    evHttp.get(),
-                                    _address.c_str(),
-                                    _port
-                                );
-                                if(!boundSocket)
-                                    throw std::runtime_error("Failed to bind server socket.");
-                                socket = evhttp_bound_socket_get_fd(boundSocket);
-                                if (socket == -1)
-                                    throw std::runtime_error("Failed to get server socket descriptor for next instance.");
-                            } else {
-                                if (evhttp_accept_socket(evHttp.get(), socket) == -1)
-                                    throw std::runtime_error("Failed to bind server socket for new instance.");
-                            }
-                            std::cout << "E" << std::endl;
-                            while(!this->stopped) {
-                                event_base_loop(eventBase.get(), EVLOOP_NONBLOCK);
-                                std::this_thread::sleep_for(std::chrono::milliseconds(30));
-                            }
-                        } catch(...) {
-                            initializationException = std::current_exception();
-                        }
-                    }
-                )
-            );
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            if (initializationException != std::exception_ptr())
-            {
-                this->stopped = true;
-                std::rethrow_exception(initializationException);
-            }
-            this->threads.push_back(std::move(newThread));
-        }
-    }
+  void setCallback(SimpleRestServerCallback_t _callback) { this->Callback = _callback; }
+
+  void start();
+
+public:
+  friend void handleRequestHelper(evhttp_request *, void *);
 };
