@@ -9,6 +9,9 @@
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #pragma GCC diagnostic ignored "-Wunused-value"
+#include <marian/common/project_version.h>
+#include <marian/common/cli_wrapper.h>
+#include <marian/common/config_parser.h>
 #include <marian/common/logging.h>
 #include <marian/common/utils.h>
 #include <marian/data/batch_generator.h>
@@ -25,7 +28,12 @@
 
 using namespace marian;
 
-#define EXTRA_DEBUG(body) if(CommandLineOptions->get<bool>("extra-debug", false)) { body }
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+namespace marian {
+template<typename T>
+using IPtr=marian::Ptr<T>;
+}
+#endif
 
 typedef std::pair<std::vector<std::string>, std::vector<int>> InputLines_t;
 const std::regex gLineEnderRegEx(" [\\.\\?\\!] ");
@@ -124,7 +132,11 @@ public:
       data::SentenceTuple tup(curId);
       Words words = lines_[curId];
       if(words.empty())
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+        words.push_back(0);
+#else
         words.push_back(Word::fromWordIndex(0));
+#endif
       tup.push_back(words);
       return tup;
     }
@@ -245,7 +257,11 @@ public:
       const Ptr<History>& _history,
       const std::vector<int>& _wordIndexes,
       size_t _wordCount) {
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+    auto NBest = _history->NBest(SIZE_MAX);
+#else
     auto NBest = _history->nBest(SIZE_MAX);
+#endif
     std::vector<TranslationResult_t> Result;
     for(const auto& Item : NBest) {
       Words OutputWordVocabIds;
@@ -263,7 +279,11 @@ public:
       EXTRA_DEBUG(std::cout << "Decoding BPE ..." << std::endl;)
       std::tie(OutputWordIndexes, OutputWords) = this->bpe_->Decode(OutputWordsBpe);
       EXTRA_DEBUG(std::cout << "Getting soft alignment ...  " << _wordCount << ":" << OutputWordIndexes.size() << std::endl;)
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+      data::SoftAlignment RawAlignment = Hypothesis->TracebackAlignment();
+#else
       data::SoftAlignment RawAlignment = Hypothesis->tracebackAlignment();
+#endif
       EXTRA_DEBUG(std::cout << "Converting soft alignment ... " << RawAlignment.size() << "x" << RawAlignment[0].size() <<  std::endl;)
       for(size_t i = 0; i < OutputWordIndexes.size(); ++i)
           std::cout << OutputWordIndexes[i] << ",";
@@ -295,7 +315,11 @@ public:
     auto WordIndexes = this->srcVocabs_[0]->encode(_sentence, false, true);
     std::vector<std::string> Words(WordIndexes.size());
     std::transform(WordIndexes.begin(), WordIndexes.end(), Words.begin(), [&](const IndexType& e) {
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+      return this->srcVocabs_[0]->operator[](e);
+#else
       return this->srcVocabs_[0]->operator[](Word::fromWordIndex(e));
+#endif
     });
     return Words;
   }
@@ -328,7 +352,9 @@ public:
     for(auto device : devices) {
       auto graph = New<ExpressionGraph>(true);
       graph->setDevice(device);
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
       graph->getBackend()->setClip(options_->get<float>("clip-gemm"));
+#endif
       graph->reserveWorkspaceMB(options_->get<size_t>("workspace"));
       graphs_.push_back(graph);
 
@@ -384,13 +410,21 @@ public:
         }
 
         EXTRA_DEBUG(std::cout << "Creating search ..." << std::endl;)
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+        auto search = New<Search>(options_, scorers, trgVocab_->getEosId(), trgVocab_->getUnkId());
+#else
         auto search = New<Search>(options_, scorers, trgVocab_);
+#endif
         EXTRA_DEBUG(std::cout << "Searching ..." << std::endl;)
         auto histories = search->search(graph, batch);
         EXTRA_DEBUG(std::cout << "Search done." << std::endl;)
 
         for(auto history : histories) {
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+          long id = (long)history->GetLineNum();
+#else
           long id = (long)history->getLineNum();
+#endif
           EXTRA_DEBUG(std::cout << "Gathering history (" << id << ")" << std::endl;)
           collector->add(id,
                          WordStrs.at(id),
@@ -564,7 +598,22 @@ void mergeToPreviousOutputItem(OutputItem_t& _item, const OutputItem_t& _secondI
 }
 
 int main(int argc, char* argv[]) {
-  CommandLineOptions =  parseOptions(argc, argv, cli::mode::translation, true);
+
+#if (PROJECT_VERSION_MAJOR > 1) || (PROJECT_VERSION_MINOR > 7)
+  ConfigParser Parser(cli::mode::translation);
+  Parser.addOption<std::string>(
+    "--bpe_file",
+    "General options",
+    "Path to bpe model for use with tokenization of input string",
+    "");
+  Parser.addOption<bool>(
+    "--extra_debug",
+    "General options",
+    "Enable/Disable extra debugging logs",
+    false);
+  CommandLineOptions = Parser.parseOptions(argc, argv, true);
+#else
+#endif
 
   auto& Options = CommandLineOptions;
   Options->set("inference", true);

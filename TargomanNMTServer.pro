@@ -18,8 +18,11 @@ SOURCES = \
     src/main.cpp
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 LIBS += \
+    -L/usr/local/cuda/lib64\
+    -L/opt/intel/mkl/lib/intel64_lin\
     -Llibmarian/lib\
     -lmarian\
+    -lmarian_cuda\
     -levent\
     -lfbgemm\
     -lasmjit\
@@ -29,6 +32,15 @@ LIBS += \
     -lintgemm\
     -lsentencepiece\
     -lsentencepiece_train\
+    -lcudart\
+    -lcudnn\
+    -lcublas\
+    -lcusparse\
+    -lcurand\
+    -lmkl_intel_lp64\
+    -lmkl_rt\
+    -lmkl_core\
+    -lmkl_sequential\
     -lrt
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 INCLUDEPATH += libmarian/include libmarian/include/marian libmarian/include/marian/3rd_party

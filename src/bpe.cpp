@@ -120,7 +120,7 @@ void BPE::PrintSegment(const std::string& sentence) {
     if (words[wi].empty()) continue;
     auto codes = Encode(words[wi]);
 
-    if(CommandLineOptions->get<bool>("extra-debug", false)) {
+    if(CommandLineOptions->get<bool>("extra_debug", false)) {
       std::cout << __FUNCTION__ << std::endl;
       for (size_t i = 0; i < codes.size() - 1; ++i) {
         std::cout << codes[i] << " ";
