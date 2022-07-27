@@ -22,6 +22,7 @@
 #include <marian/data/types.h>
 #include <marian/marian.h>
 #include <marian/translator/beam_search.h>
+#include <marian/translator/output_collector.h>
 #pragma GCC diagnostic pop
 #include "server.h"
 #include "./debug.h"
@@ -272,10 +273,8 @@ public:
       EXTRA_DEBUG(std::cout << "Getting BPE words ..." << std::endl;)
       for(size_t i = 0; i < OutputWordVocabIds.size() - 1; ++i)
         OutputWordsBpe[i] = this->trgVocab_->operator[](OutputWordVocabIds[i]);
-
       std::vector<int> OutputWordIndexes;
       std::vector<std::string> OutputWords;
-
       EXTRA_DEBUG(std::cout << "Decoding BPE ..." << std::endl;)
       std::tie(OutputWordIndexes, OutputWords) = this->bpe_->Decode(OutputWordsBpe);
       EXTRA_DEBUG(std::cout << "Getting soft alignment ...  " << _wordCount << ":" << OutputWordIndexes.size() << std::endl;)
@@ -299,7 +298,7 @@ public:
         auto k = OutputWordIndexes[i];
         for(size_t j = 0; j < _wordIndexes.size(); ++j) {
           auto l = _wordIndexes[j];
-	  EXTRA_DEBUG(std::cout << "k,l <= i, j ... " << k << "," << l << " <= " << i << "," << j << std::endl;)
+	        EXTRA_DEBUG(std::cout << "k,l <= i, j ... " << k << "," << l << " <= " << i << "," << j << std::endl;)
           Alignment[k][l] += RawAlignment[i][j];
         }
       }
@@ -327,7 +326,9 @@ public:
   void init() {
     // initialize vocabs
 
-    this->bpe_ = New<BPE>(options_->get<std::string>("bpe_file"), "@@");
+    this->bpe_ = nullptr;
+    if(options_->get<std::string>("bpe_file").size() > 0)
+      this->bpe_ = New<BPE>(options_->get<std::string>("bpe_file"), "@@");
 
     auto vocabPaths = options_->get<std::vector<std::string>>("vocabs");
     std::vector<int> maxVocabs = options_->get<std::vector<int>>("dim-vocabs");
@@ -365,37 +366,11 @@ public:
     }
   }
 
-  std::vector<TranslateFuncResult_t> run(const std::vector<std::string> inputs) {
-    std::vector<std::vector<std::string>> WordStrs;
-    std::vector<std::vector<Word>> Words;
-    std::vector<std::vector<int>> WordIndexes;
-    EXTRA_DEBUG(std::cout << "Applying BPE ..." << std::endl;)
-    for(const auto& Line : inputs) {
-      std::vector<std::string> LineTokens;
-      utils::split(Line, LineTokens, " ");
-      std::vector<Word> LineWords;
-      std::vector<int> LineWordIndexes;
-      for(size_t TokenIndex = 0; TokenIndex < LineTokens.size(); ++TokenIndex) {
-        const auto& Token = LineTokens[TokenIndex];
-        auto Parts = this->bpe_->Encode(Token);
-        for(const auto& Part : Parts) {
-          auto Word_ = this->srcVocabs_[0]->operator[](Part);
-          LineWords.push_back(Word_);
-          LineWordIndexes.push_back(TokenIndex);
-        }
-      }
-      LineWords.push_back(this->srcVocabs_[0]->getEosId());
-      WordStrs.emplace_back(LineTokens);
-      Words.emplace_back(LineWords);
-      WordIndexes.emplace_back(LineWordIndexes);
-    }
-    EXTRA_DEBUG(std::cout << "Applying BPE Done." << std::endl;)
-
-    auto corpus_ = New<TextTokensInput>(Words, srcVocabs_, options_);
-    data::BatchGenerator<TextTokensInput> batchGenerator(corpus_, options_);
-
-    auto collector = New<clsOutputCollector>();
-
+  template<typename CollectionCallback>
+  void runOnCorpusAndCollect(
+    data::BatchGenerator<TextTokensInput>& batchGenerator,
+    CollectionCallback collect
+  ) {
     batchGenerator.prepare();
 
     std::vector<std::future<void>> taskResults;
@@ -425,12 +400,7 @@ public:
 #else
           long id = (long)history->getLineNum();
 #endif
-          EXTRA_DEBUG(std::cout << "Gathering history (" << id << ")" << std::endl;)
-          collector->add(id,
-                         WordStrs.at(id),
-                         this->convertToTranslationResultVector(
-                             history, WordIndexes.at(id), WordStrs.at(id).size()));
-          EXTRA_DEBUG(std::cout << "Gathering history (" << id << ") done." << std::endl;)
+          collect(id, history);
         }
         EXTRA_DEBUG(std::cout << "Task (" << id << ") done." << std::endl;)
       };
@@ -440,7 +410,72 @@ public:
     }
     for(auto& f : taskResults)
         f.wait();
+  }
 
+  std::vector<std::string> runFlatForm(const std::vector<std::string> inputs) {
+    std::vector<Words> Words;
+    for(const auto& line : inputs) {
+      Words.emplace_back(this->srcVocabs_[0]->encode(line, true, true));
+    }
+    auto corpus_ = New<TextTokensInput>(Words, srcVocabs_, this->options_);
+    data::BatchGenerator<TextTokensInput> batchGenerator(corpus_, this->options_);
+
+    auto collector = New<StringCollector>();
+    this->runOnCorpusAndCollect(batchGenerator, [&] (long id, Ptr<History>& history) {
+      EXTRA_DEBUG(std::cout << "Gathering history (" << id << ")" << std::endl;)
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+      auto words = std::get<0>(history->Top());
+#else
+      auto words = std::get<0>(history->top());
+#endif
+      collector->add(id, this->trgVocab_->decode(words), std::string());
+      EXTRA_DEBUG(std::cout << "Gathering history (" << id << ") done." << std::endl;)
+    });
+    return collector->collect(/*nbest=*/false);
+  }
+
+  std::vector<TranslateFuncResult_t> run(const std::vector<std::string> inputs) {
+    std::vector<std::vector<std::string>> WordStrs;
+    std::vector<std::vector<Word>> Words;
+    std::vector<std::vector<int>> WordIndexes;
+
+    EXTRA_DEBUG(std::cout << "Applying BPE ..." << std::endl;)
+    for(const auto& Line : inputs) {
+      std::vector<std::string> LineTokens;
+      utils::split(Line, LineTokens, " ");
+      std::vector<Word> LineWords;
+      std::vector<int> LineWordIndexes;
+      for(size_t TokenIndex = 0; TokenIndex < LineTokens.size(); ++TokenIndex) {
+        const auto& Token = LineTokens[TokenIndex];
+        auto Parts = this->bpe_->Encode(Token);
+        for(const auto& Part : Parts) {
+          auto Word_ = this->srcVocabs_[0]->operator[](Part);
+          LineWords.push_back(Word_);
+          LineWordIndexes.push_back(TokenIndex);
+        }
+      }
+      LineWords.push_back(this->srcVocabs_[0]->getEosId());
+      WordStrs.emplace_back(LineTokens);
+      Words.emplace_back(LineWords);
+      WordIndexes.emplace_back(LineWordIndexes);
+    }
+    EXTRA_DEBUG(std::cout << "Applying BPE Done." << std::endl;)
+
+    auto corpus_ = New<TextTokensInput>(Words, srcVocabs_, this->options_);
+    data::BatchGenerator<TextTokensInput> batchGenerator(corpus_, this->options_);
+
+    auto collector = New<clsOutputCollector>();
+    this->runOnCorpusAndCollect(batchGenerator, [&] (long id, Ptr<History>& history) {
+      EXTRA_DEBUG(std::cout << "Gathering history (" << id << ")" << std::endl;)
+      collector->add(id, WordStrs.at(id),
+        this->convertToTranslationResultVector(
+          history,
+          WordIndexes.at(id),
+          WordStrs.at(id).size()
+        )
+      );
+      EXTRA_DEBUG(std::cout << "Gathering history (" << id << ") done." << std::endl;)
+    });
     return collector->collect();
   }
 };
@@ -613,6 +648,27 @@ int main(int argc, char* argv[]) {
     false);
   CommandLineOptions = Parser.parseOptions(argc, argv, true);
 #else
+  std::vector<char*> filtered_args;
+  std::string bpeFile = "";
+  bool extraDebug = false;
+  int argIndex = 0;
+  while(argIndex < argc) {
+    if(strcmp(argv[argIndex], "--bpe_file") == 0) {
+      ++argIndex;
+      bpeFile = argIndex < argc ? argv[argIndex] : "";
+    } else if(strcmp(argv[argIndex], "--extra_debug") == 0) {
+      extraDebug = true;
+    } else
+      filtered_args.push_back(argv[argIndex]);
+    ++argIndex;
+  }
+  CommandLineOptions = parseOptions(
+    static_cast<int>(filtered_args.size()),
+    const_cast<char**>(filtered_args.data()),
+    cli::mode::translation,
+    true);
+  CommandLineOptions->set("extra_debug", extraDebug);
+  CommandLineOptions->set("bpe_file", bpeFile);
 #endif
 
   auto& Options = CommandLineOptions;
@@ -626,52 +682,96 @@ int main(int argc, char* argv[]) {
   TranslateService<BeamSearch> TranslationService(Options);
 
   clsSimpleRestServer Server("0.0.0.0", 8080, 16);
-  Server.setCallback([&](const clsSimpleRestRequest& _request, clsSimpleRestResponse& _response) {
-    std::vector<std::string> Sentences;
-    std::vector<int> LineNumbers;
-    std::tie(Sentences, LineNumbers) = getTextLines(_request);
-    auto RawResults = TranslationService.run(Sentences);
+  if(Options->get<std::string>("bpe_file").size() > 0) {
+    Server.setCallback([&](const clsSimpleRestRequest& _request, clsSimpleRestResponse& _response) {
+      std::vector<std::string> Sentences;
+      std::vector<int> LineNumbers;
+      std::tie(Sentences, LineNumbers) = getTextLines(_request);
+      auto RawResults = TranslationService.run(Sentences);
 
-    std::vector<OutputItem_t> Result;
-    int PreviousLineNumber = -1;
-    for(size_t Dummy = 0; Dummy < RawResults.size(); ++Dummy) {
-      std::vector<std::string> SourceTokens;
-      std::vector<TranslationResult_t> NBestTranslations;
-      std::tie(SourceTokens, NBestTranslations) = RawResults[Dummy];
-      if(NBestTranslations.size() > 0) {
-        OutputItem_t Item = convertTranslationToOutputItem(SourceTokens, NBestTranslations);
-        if(PreviousLineNumber == LineNumbers[Dummy])
-          mergeToPreviousOutputItem(Result[Result.size() - 1], Item);
-        else
-          Result.push_back(Item);
-      } else {
-        Result.push_back(std::make_tuple(std::vector<std::string>(),
-                                         std::vector<std::vector<std::string>>(),
-                                         std::vector<std::vector<int>>()));
+      std::vector<OutputItem_t> Result;
+      int PreviousLineNumber = -1;
+      for(size_t Dummy = 0; Dummy < RawResults.size(); ++Dummy) {
+        std::vector<std::string> SourceTokens;
+        std::vector<TranslationResult_t> NBestTranslations;
+        std::tie(SourceTokens, NBestTranslations) = RawResults[Dummy];
+        if(NBestTranslations.size() > 0) {
+          OutputItem_t Item = convertTranslationToOutputItem(SourceTokens, NBestTranslations);
+          if(PreviousLineNumber == LineNumbers[Dummy])
+            mergeToPreviousOutputItem(Result[Result.size() - 1], Item);
+          else
+            Result.push_back(Item);
+        } else {
+          Result.push_back(std::make_tuple(std::vector<std::string>(),
+                                          std::vector<std::vector<std::string>>(),
+                                          std::vector<std::vector<int>>()));
+        }
+        PreviousLineNumber = LineNumbers[Dummy];
       }
-      PreviousLineNumber = LineNumbers[Dummy];
-    }
 
-    _response << "{\"rslt\":[";
-    bool First = true;
-    for(const auto& Item : Result) {
-      std::vector<std::string> SourceTokens;
-      std::vector<std::vector<std::string>> Phrases;
-      std::vector<std::vector<int>> Alignments;
-      std::tie(SourceTokens, Phrases, Alignments) = Item;
-      if(First)
-        _response << "{";
-      else
-        _response << ",{";
-      _response << "\"tokens\":" << SourceTokens << ",";
-      _response << "\"phrases\":" << Phrases << ",";
-      _response << "\"alignments\":" << Alignments << "}";
-      First = false;
-    }
-    _response << "],\"serverName\":" << ServerName << "}";
-    _response.send();
-    LOG(info, "[rest server] Request answered.");
-  });
+      _response << "{\"rslt\":[";
+      bool First = true;
+      for(const auto& Item : Result) {
+        std::vector<std::string> SourceTokens;
+        std::vector<std::vector<std::string>> Phrases;
+        std::vector<std::vector<int>> Alignments;
+        std::tie(SourceTokens, Phrases, Alignments) = Item;
+        if(First)
+          _response << "{";
+        else
+          _response << ",{";
+        _response << "\"tokens\":" << SourceTokens << ",";
+        _response << "\"phrases\":" << Phrases << ",";
+        _response << "\"alignments\":" << Alignments << "}";
+        First = false;
+      }
+      _response << "],\"serverName\":" << ServerName << "}";
+      _response.send();
+      LOG(info, "[rest server] Request answered.");
+    });
+  } else {
+    Server.setCallback([&](const clsSimpleRestRequest& _request, clsSimpleRestResponse& _response) {
+      std::vector<std::string> Sentences;
+      std::vector<int> LineNumbers;
+      std::tie(Sentences, LineNumbers) = getTextLines(_request);
+      auto Results = TranslationService.runFlatForm(Sentences);
+      if(Sentences.size() != Results.size() || Sentences.size() != LineNumbers.size())
+        throw std::runtime_error("Internal server error (number of sentences are different from translations)");
+      int MaxLineNumber = -1;
+      for(size_t i = 0; i < LineNumbers.size(); ++i)
+        if(MaxLineNumber < LineNumbers[i])
+          MaxLineNumber = LineNumbers[i];
+      std::vector<std::vector<std::string>> FinalTokens;
+      std::vector<std::vector<std::string>> FinalPhrases;
+      FinalTokens.resize(MaxLineNumber + 1);
+      FinalPhrases.resize(MaxLineNumber + 1);
+      for(size_t i = 0; i < Sentences.size(); ++i) {
+        int LineNo = LineNumbers[i];
+        FinalTokens[LineNo].emplace_back(std::move(Sentences[i]));
+        FinalPhrases[LineNo].emplace_back(std::move(Results[i]));
+      }
+      _response << "{\"rslt\":[";
+      for(int i = 0; i <= MaxLineNumber; ++i) {
+        if(i == 0)
+          _response << "{";
+        else
+          _response << ",{";
+        _response << "\"tokens\":" << FinalTokens[i] << ",";
+        _response << "\"phrases\":" << FinalPhrases[i] << ",";
+        _response << "\"alignments\": [";
+        for(size_t j = 0; j < FinalPhrases[i].size(); ++j) {
+          if(j == 0)
+            _response << "[" << static_cast<int>(j) << "]";
+          else
+            _response << ",[" << static_cast<int>(j) << "]";
+        }
+        _response << "]}";
+      }
+      _response << "],\"serverName\":" << ServerName << "}";
+      _response.send();
+      LOG(info, "[rest server] Request answered.");
+    });
+  }
   Server.start();
   return 0;
 }

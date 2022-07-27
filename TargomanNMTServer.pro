@@ -17,6 +17,34 @@ SOURCES = \
     src/server.cpp \
     src/main.cpp
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
+CONFIG(OldMarian) {
+message("////////////////////////////////////////////////////")
+message("//           With old marian nmt                  //")
+message("////////////////////////////////////////////////////")
+LIBS += \
+    -L/usr/local/cuda/lib64\
+    -L/opt/intel/mkl/lib/intel64_lin\
+    -Llibmarian/lib\
+    -lmarian\
+    -lmarian_cuda\
+    -levent\
+    -lcudart\
+    -lcudnn\
+    -lcublas\
+    -lcusparse\
+    -lcurand\
+    -lmkl_intel_lp64\
+    -lmkl_rt\
+    -lmkl_core\
+    -lmkl_sequential\
+    -lboost_iostreams\
+    -lboost_timer\
+    -lz\
+    -lrt
+} else {
+message("////////////////////////////////////////////////////")
+message("//           With new marian nmt                  //")
+message("////////////////////////////////////////////////////")
 LIBS += \
     -L/usr/local/cuda/lib64\
     -L/opt/intel/mkl/lib/intel64_lin\
@@ -41,7 +69,8 @@ LIBS += \
     -lmkl_rt\
     -lmkl_core\
     -lmkl_sequential\
-    -lrt
+    -lrt    
+}
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
 INCLUDEPATH += libmarian/include libmarian/include/marian libmarian/include/marian/3rd_party
 # +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-#
