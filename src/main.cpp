@@ -697,16 +697,24 @@ int main(int argc, char* argv[]) {
     "General options",
     "Enable/Disable extra debugging logs",
     false);
+  Parser.addOption<std::string>(
+    "--server-name",
+    "General options",
+    "Name to identify model/engine combination",
+    "");
   CommandLineOptions = Parser.parseOptions(argc, argv, true);
 #else
   std::vector<char*> filtered_args;
-  std::string bpeFile = "";
+  std::string bpeFile = "", serverName = "";
   bool extraDebug = false;
   int argIndex = 0;
   while(argIndex < argc) {
     if(strcmp(argv[argIndex], "--bpe_file") == 0) {
       ++argIndex;
       bpeFile = argIndex < argc ? argv[argIndex] : "";
+    } else if(strcmp(argv[argIndex], "--server-name") == 0) {
+      ++argIndex;
+      serverName = argIndex < argc ? argv[argIndex] : "";
     } else if(strcmp(argv[argIndex], "--extra_debug") == 0) {
       extraDebug = true;
     } else
@@ -720,6 +728,7 @@ int main(int argc, char* argv[]) {
     true);
   CommandLineOptions->set("extra_debug", extraDebug);
   CommandLineOptions->set("bpe_file", bpeFile);
+  CommandLineOptions->set("server-name", serverName);
 #endif
 
   auto& Options = CommandLineOptions;
@@ -728,7 +737,7 @@ int main(int argc, char* argv[]) {
   Options->set("alignment", "soft");
   Options->set("allow-unk", true);
 
-  const std::string ServerName;
+  const std::string ServerName(Options->get<std::string>("server-name"));
 
   TranslateService<BeamSearch> TranslationService(Options);
 
