@@ -231,6 +231,32 @@ protected:
   Outputs_t Outputs;
 };
 
+class clsNBestCollector {
+public:
+  clsNBestCollector() : MaxId(-1){};
+  clsNBestCollector(const clsNBestCollector&) = delete;
+
+  void add(long _sourceId, std::vector<std::string>&& _nBest) {
+    std::lock_guard<std::mutex> Lock(this->Mutex);
+    this->Outputs[_sourceId] = std::move(_nBest);
+    if(this->MaxId <= _sourceId)
+      this->MaxId = _sourceId;
+  }
+  std::vector<std::vector<std::string>> collect() {
+    std::vector<std::vector<std::string>> Result;
+    for(int Id = 0; Id <= this->MaxId; ++Id)
+      Result.emplace_back(std::move(this->Outputs[Id]));
+    return Result;
+  }
+
+protected:
+  long MaxId;
+  std::mutex Mutex;
+
+  typedef std::map<long, std::vector<std::string>> Outputs_t;
+  Outputs_t Outputs;
+};
+
 template <class Search>
 class TranslateService {
 private:
@@ -412,7 +438,11 @@ public:
         f.wait();
   }
 
-  std::vector<std::string> runFlatForm(const std::vector<std::string> inputs) {
+/*
+  std::vector<std::string>
+*/
+  std::vector<std::vector<std::string>>
+  runFlatForm(const std::vector<std::string> inputs) {
     std::vector<Words> Words;
     for(const auto& line : inputs) {
       Words.emplace_back(this->srcVocabs_[0]->encode(line, true, true));
@@ -420,18 +450,39 @@ public:
     auto corpus_ = New<TextTokensInput>(Words, srcVocabs_, this->options_);
     data::BatchGenerator<TextTokensInput> batchGenerator(corpus_, this->options_);
 
+/*
     auto collector = New<StringCollector>();
+*/
+    auto collector = New<clsNBestCollector>();
     this->runOnCorpusAndCollect(batchGenerator, [&] (long id, Ptr<History>& history) {
       EXTRA_DEBUG(std::cout << "Gathering history (" << id << ")" << std::endl;)
+/*
 #if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
       auto words = std::get<0>(history->Top());
 #else
       auto words = std::get<0>(history->top());
 #endif
       collector->add(id, this->trgVocab_->decode(words), std::string());
+*/
+      std::vector<std::string> nBest;
+#if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 10)
+      for(const auto& item : history->NBest(SIZE_MAX)) {
+        auto words = std::get<0>(item);
+        nBest.push_back(this->trgVocab_->decode(words));
+      }
+#else
+      for(const auto& item : history->nBest(SIZE_MAX)) {
+        auto words = std::get<0>(item);
+        nBest.push_back(this->trgVocab_->decode(words));
+      }
+#endif
+      collector->add(id, std::move(nBest));
       EXTRA_DEBUG(std::cout << "Gathering history (" << id << ") done." << std::endl;)
     });
-    return collector->collect(/*nbest=*/false);
+/*
+    return collector->collect(false);
+*/
+    return collector->collect();
   }
 
   std::vector<TranslateFuncResult_t> run(const std::vector<std::string> inputs) {
@@ -742,7 +793,7 @@ int main(int argc, char* argv[]) {
         if(MaxLineNumber < LineNumbers[i])
           MaxLineNumber = LineNumbers[i];
       std::vector<std::vector<std::string>> FinalTokens;
-      std::vector<std::vector<std::string>> FinalPhrases;
+      std::vector<decltype(Results)> FinalPhrases;
       FinalTokens.resize(MaxLineNumber + 1);
       FinalPhrases.resize(MaxLineNumber + 1);
       for(size_t i = 0; i < Sentences.size(); ++i) {
