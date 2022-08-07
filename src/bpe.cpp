@@ -261,7 +261,7 @@ std::vector<std::string> BPE::SplitWordIntoLetters(const std::string& word) cons
   auto e = charWord + strlen(charWord);
 
   std::vector<std::string> letters;
-  int prevBegin = 0;
+  // int prevBegin = 0;
   while (b != e) {
     int end = utf8::next(b, e);
     std::vector<unsigned char> utf8result;

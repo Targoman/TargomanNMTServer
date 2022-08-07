@@ -4,7 +4,7 @@
 #include <memory>
 #include <regex>
 #include "bpe.h"
-#include "gason.h"
+#include "json.hpp"
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -40,32 +40,25 @@ typedef std::pair<std::vector<std::string>, std::vector<int>> InputLines_t;
 const std::regex gLineEnderRegEx(" [\\.\\?\\!] ");
 InputLines_t getTextLines(const clsSimpleRestRequest& _request) {
   InputLines_t Result;
-  Json::JsonValue Value;
-  Json::JsonAllocator Allocator;
 
   std::string Body = _request.getBody();
   LOG(info, "[rest-server] Request with BODY\n{}\n", Body);
-  char* EndPtr;
-  int status = Json::jsonParse(const_cast<char*>(Body.c_str()), &EndPtr, &Value, Allocator);
-  if(status != Json::JSON_OK)
-    throw std::runtime_error("Input is not a valid JSON string.");
-  if(Value.getTag() != Json::JSON_ARRAY)
+
+  auto JSON = nlohmann::json::parse(Body);
+
+  if(!JSON.is_array())
     throw std::runtime_error("Input string must be a JSON array.");
+  
   int LineIndex = 0;
-  for(auto Elem : Value) {
-    if(Elem->value.getTag() != Json::JSON_OBJECT)
-      throw std::runtime_error(
-          "Each element of the input array must be an object containing `src` field.");
-    std::string Src;
-    for(auto i : Elem->value) {
-      if(strcmp(i->key, "src") == 0) {
-        if(i->value.getTag() != Json::JSON_STRING)
-          throw std::runtime_error("`src` field must contain string.");
-        Src = i->value.toString();
-      }
-    }
-    int i = 0;
+  for(size_t k = 0; k < JSON.size(); ++k) {
+    auto& Element = JSON.at(k);
+    if(!Element.is_object() || !Element.contains("src"))
+      throw std::runtime_error("Each element of the input array must be an object containing `src` field.");
+    if(!Element["src"].is_string())
+      throw std::runtime_error("`src` field must contain string.");
+    std::string Src = Element["src"].get<std::string>();
     std::smatch LineEnderMatch;
+    int i = 0;
     while(std::regex_search(Src, LineEnderMatch, gLineEnderRegEx)) {
       int j = LineEnderMatch.position() + 2;
       if(j > i) {
@@ -80,7 +73,6 @@ InputLines_t getTextLines(const clsSimpleRestRequest& _request) {
     }
     ++LineIndex;
   }
-
   return Result;
 }
 
@@ -244,8 +236,9 @@ public:
   }
   std::vector<std::vector<std::string>> collect() {
     std::vector<std::vector<std::string>> Result;
-    for(int Id = 0; Id <= this->MaxId; ++Id)
+    for(int Id = 0; Id <= this->MaxId; ++Id) {
       Result.emplace_back(std::move(this->Outputs[Id]));
+    }
     return Result;
   }
 
@@ -297,8 +290,9 @@ public:
       std::tie(OutputWordVocabIds, Hypothesis, Score) = Item;
       std::vector<std::string> OutputWordsBpe(OutputWordVocabIds.size() - 1);
       EXTRA_DEBUG(std::cout << "Getting BPE words ..." << std::endl;)
-      for(size_t i = 0; i < OutputWordVocabIds.size() - 1; ++i)
+      for(size_t i = 0; i < OutputWordVocabIds.size() - 1; ++i) {
         OutputWordsBpe[i] = this->trgVocab_->operator[](OutputWordVocabIds[i]);
+      }
       std::vector<int> OutputWordIndexes;
       std::vector<std::string> OutputWords;
       EXTRA_DEBUG(std::cout << "Decoding BPE ..." << std::endl;)
@@ -310,9 +304,6 @@ public:
       data::SoftAlignment RawAlignment = Hypothesis->tracebackAlignment();
 #endif
       EXTRA_DEBUG(std::cout << "Converting soft alignment ... " << RawAlignment.size() << "x" << RawAlignment[0].size() <<  std::endl;)
-      for(size_t i = 0; i < OutputWordIndexes.size(); ++i)
-          std::cout << OutputWordIndexes[i] << ",";
-      std::cout << std::endl;
       data::SoftAlignment Alignment(OutputWords.size());
       for(size_t i = 0; i < OutputWords.size(); ++i) {
         Alignment[i].resize(_wordCount);
@@ -594,6 +585,12 @@ OutputItem_t convertTranslationToOutputItem(
   const std::vector<int> WordMapping
       = getWordMapping(_translationResult[0].second, _sourceTokens, BestTranslation);
 
+  // std::cout << "****************************************************************" << std::endl;
+  // for(const auto& e : WordMapping)
+  //   std::cout << e << ",";
+  // std::cout << std::endl;
+  // std::cout << "****************************************************************" << std::endl;
+
   std::vector<std::vector<std::string>> Phrases;
   std::vector<std::vector<int>> Alignments;
 
@@ -609,7 +606,7 @@ OutputItem_t convertTranslationToOutputItem(
       Phrases[PhraseCount - 1][0] += std::string(" ") + TargetWord;
     } else {
       Phrases.push_back({TargetWord});
-      Alignments.push_back({(int)SourceIndex});
+      Alignments.push_back({static_cast<int>(SourceIndex)});
       ++PhraseCount;
     }
     LastSourceIndex = SourceIndex;
@@ -657,11 +654,9 @@ OutputItem_t convertTranslationToOutputItem(
 }
 
 void mergeToPreviousOutputItem(OutputItem_t& _item, const OutputItem_t& _secondItem) {
-  std::vector<std::string> SourceTokens;
-  std::vector<std::vector<std::string>> Phrases;
-  std::vector<std::vector<int>> Alignments;
-
-  std::tie(SourceTokens, Phrases, Alignments) = _item;
+  std::vector<std::string>& SourceTokens = std::get<0>(_item);
+  std::vector<std::vector<std::string>>& Phrases = std::get<1>(_item);
+  std::vector<std::vector<int>>& Alignments = std::get<2>(_item);
 
   std::vector<std::string> ExtSourceTokens;
   std::vector<std::vector<std::string>> ExtPhrases;
@@ -681,6 +676,14 @@ void mergeToPreviousOutputItem(OutputItem_t& _item, const OutputItem_t& _secondI
       UpdatedAlignments.push_back(a + SourceOffset);
     Alignments.push_back(UpdatedAlignments);
   }
+  // std::cout << "/////////////////////////////////////////////////////" << std::endl;
+  // for(size_t ii = 0; ii < Alignments.size(); ++ii) {
+  //   for(size_t jj = 0; jj < Alignments[ii].size(); ++jj) {
+  //     std::cout << Alignments[ii][jj] << ", ";
+  //   }
+  //   std::cout << std::endl;
+  // }
+  // std::cout << "/////////////////////////////////////////////////////" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -698,37 +701,39 @@ int main(int argc, char* argv[]) {
     "Enable/Disable extra debugging logs",
     false);
   Parser.addOption<std::string>(
-    "--server-name",
+    "--server_name",
     "General options",
     "Name to identify model/engine combination",
     "");
   CommandLineOptions = Parser.parseOptions(argc, argv, true);
 #else
-  std::vector<char*> filtered_args;
-  std::string bpeFile = "", serverName = "";
-  bool extraDebug = false;
-  int argIndex = 0;
-  while(argIndex < argc) {
-    if(strcmp(argv[argIndex], "--bpe_file") == 0) {
+  if(true) {
+    std::vector<char*> filtered_args;
+    std::string bpeFile = "", serverName = "";
+    bool extraDebug = false;
+    int argIndex = 0;
+    while(argIndex < argc) {
+      if(strcmp(argv[argIndex], "--bpe_file") == 0) {
+        ++argIndex;
+        bpeFile = argIndex < argc ? argv[argIndex] : "";
+      } else if(strcmp(argv[argIndex], "--server_name") == 0) {
+        ++argIndex;
+        serverName = argIndex < argc ? argv[argIndex] : "";
+      } else if(strcmp(argv[argIndex], "--extra_debug") == 0) {
+        extraDebug = true;
+      } else
+        filtered_args.push_back(argv[argIndex]);
       ++argIndex;
-      bpeFile = argIndex < argc ? argv[argIndex] : "";
-    } else if(strcmp(argv[argIndex], "--server-name") == 0) {
-      ++argIndex;
-      serverName = argIndex < argc ? argv[argIndex] : "";
-    } else if(strcmp(argv[argIndex], "--extra_debug") == 0) {
-      extraDebug = true;
-    } else
-      filtered_args.push_back(argv[argIndex]);
-    ++argIndex;
+    }
+    CommandLineOptions = parseOptions(
+      static_cast<int>(filtered_args.size()),
+      const_cast<char**>(filtered_args.data()),
+      cli::mode::translation,
+      true);
+    CommandLineOptions->set("extra_debug", extraDebug);
+    CommandLineOptions->set("bpe_file", bpeFile);
+    CommandLineOptions->set("server_name", serverName);
   }
-  CommandLineOptions = parseOptions(
-    static_cast<int>(filtered_args.size()),
-    const_cast<char**>(filtered_args.data()),
-    cli::mode::translation,
-    true);
-  CommandLineOptions->set("extra_debug", extraDebug);
-  CommandLineOptions->set("bpe_file", bpeFile);
-  CommandLineOptions->set("server-name", serverName);
 #endif
 
   auto& Options = CommandLineOptions;
@@ -737,7 +742,7 @@ int main(int argc, char* argv[]) {
   Options->set("alignment", "soft");
   Options->set("allow-unk", true);
 
-  const std::string ServerName(Options->get<std::string>("server-name"));
+  const std::string ServerName(Options->get<std::string>("server_name", ""));
 
   TranslateService<BeamSearch> TranslationService(Options);
 
@@ -757,9 +762,18 @@ int main(int argc, char* argv[]) {
         std::tie(SourceTokens, NBestTranslations) = RawResults[Dummy];
         if(NBestTranslations.size() > 0) {
           OutputItem_t Item = convertTranslationToOutputItem(SourceTokens, NBestTranslations);
-          if(PreviousLineNumber == LineNumbers[Dummy])
+          if(PreviousLineNumber == LineNumbers[Dummy]) {
             mergeToPreviousOutputItem(Result[Result.size() - 1], Item);
-          else
+            // const auto& Alignments = std::get<2>(Result[Result.size() - 1]);
+            // std::cout << "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\" << std::endl;
+            // for(size_t ii = 0; ii < Alignments.size(); ++ii) {
+            //   for(size_t jj = 0; jj < Alignments[ii].size(); ++jj) {
+            //     std::cout << Alignments[ii][jj] << ", ";
+            //   }
+            //   std::cout << std::endl;
+            // }
+            // std::cout << "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\" << std::endl;
+          } else
             Result.push_back(Item);
         } else {
           Result.push_back(std::make_tuple(std::vector<std::string>(),
@@ -769,23 +783,22 @@ int main(int argc, char* argv[]) {
         PreviousLineNumber = LineNumbers[Dummy];
       }
 
-      _response << "{\"rslt\":[";
-      bool First = true;
+      nlohmann::json ResponseJSON;
+      auto& Rslt = ResponseJSON["rslt"] = nlohmann::json::array();
       for(const auto& Item : Result) {
         std::vector<std::string> SourceTokens;
         std::vector<std::vector<std::string>> Phrases;
         std::vector<std::vector<int>> Alignments;
         std::tie(SourceTokens, Phrases, Alignments) = Item;
-        if(First)
-          _response << "{";
-        else
-          _response << ",{";
-        _response << "\"tokens\":" << SourceTokens << ",";
-        _response << "\"phrases\":" << Phrases << ",";
-        _response << "\"alignments\":" << Alignments << "}";
-        First = false;
+        nlohmann::json RsltItem;
+        RsltItem["tokens"] = SourceTokens;
+        RsltItem["phrases"] = Phrases;
+        RsltItem["alignments"] = Alignments;
+        Rslt.push_back(RsltItem);
       }
-      _response << "],\"serverName\":" << ServerName << "}";
+      ResponseJSON["serverName"] = ServerName;
+      auto ResponseJsonString = ResponseJSON.dump();
+      _response << ResponseJsonString.c_str();
       _response.send();
       LOG(info, "[rest server] Request answered.");
     });
@@ -810,24 +823,23 @@ int main(int argc, char* argv[]) {
         FinalTokens[LineNo].emplace_back(std::move(Sentences[i]));
         FinalPhrases[LineNo].emplace_back(std::move(Results[i]));
       }
-      _response << "{\"rslt\":[";
+
+      nlohmann::json ResponseJSON;
+      auto& Rslt = ResponseJSON["rslt"] = nlohmann::json::array();
       for(int i = 0; i <= MaxLineNumber; ++i) {
-        if(i == 0)
-          _response << "{";
-        else
-          _response << ",{";
-        _response << "\"tokens\":" << FinalTokens[i] << ",";
-        _response << "\"phrases\":" << FinalPhrases[i] << ",";
-        _response << "\"alignments\": [";
-        for(size_t j = 0; j < FinalPhrases[i].size(); ++j) {
-          if(j == 0)
-            _response << "[" << static_cast<int>(j) << "]";
-          else
-            _response << ",[" << static_cast<int>(j) << "]";
-        }
-        _response << "]}";
+        nlohmann::json RsltItem;
+        RsltItem["tokens"] = FinalTokens[i];
+        RsltItem["phrases"] = FinalPhrases[i];
+        std::vector<std::vector<int>> Alignments;
+        Alignments.resize(FinalPhrases[i].size());
+       for(size_t j = 0; j < FinalPhrases[i].size(); ++j)
+          Alignments[j].push_back({ static_cast<int>(j) });
+        RsltItem["alignments"] = Alignments;
+        Rslt.push_back(RsltItem);
       }
-      _response << "],\"serverName\":" << ServerName << "}";
+      ResponseJSON["serverName"] = ServerName;
+      auto ResponseJsonString = ResponseJSON.dump();
+      _response << ResponseJsonString.c_str();
       _response.send();
       LOG(info, "[rest server] Request answered.");
     });
