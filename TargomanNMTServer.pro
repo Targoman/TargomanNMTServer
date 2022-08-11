@@ -24,14 +24,19 @@ LIBS += \
     -L/usr/local/cuda/lib64\
     -L/opt/intel/mkl/lib/intel64_lin\
     -Llibmarian/lib\
-    -lmarian\
+    -lmarian
+CONFIG(NoCUDA){
+}else{
+LIBS += \
     -lmarian_cuda\
-    -levent\
     -lcudart\
     -lcudnn\
     -lcublas\
     -lcusparse\
-    -lcurand\
+    -lcurand
+}
+LIBS += \
+    -levent\
     -lmkl_intel_lp64\
     -lmkl_rt\
     -lmkl_core\
@@ -48,8 +53,18 @@ LIBS += \
     -L/usr/local/cuda/lib64\
     -L/opt/intel/mkl/lib/intel64_lin\
     -Llibmarian/lib\
-    -lmarian\
+    -lmarian
+CONFIG(NoCUDA){
+}else{
+LIBS += \
     -lmarian_cuda\
+    -lcudart\
+    -lcudnn\
+    -lcublas\
+    -lcusparse\
+    -lcurand
+}
+LIBS += \
     -levent\
     -lfbgemm\
     -lasmjit\
@@ -59,11 +74,6 @@ LIBS += \
     -lintgemm\
     -lsentencepiece\
     -lsentencepiece_train\
-    -lcudart\
-    -lcudnn\
-    -lcublas\
-    -lcusparse\
-    -lcurand\
     -lmkl_intel_lp64\
     -lmkl_rt\
     -lmkl_core\
