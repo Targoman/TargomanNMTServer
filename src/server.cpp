@@ -15,8 +15,6 @@ void clsSimpleRestServer::start() {
   std::setvbuf(stdout, NULL, _IONBF, 0);
   std::setvbuf(stdin, NULL, _IONBF, 0);
 
-  std::atomic_bool Done;
-
   auto ThreadDeleter = [&](std::thread* _thread) {
     Done = true;
     _thread->join();

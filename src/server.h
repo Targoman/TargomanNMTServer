@@ -84,6 +84,7 @@ private:
   std::string Address;
   uint16_t Port;
   int ThreadCount;
+  std::atomic_bool Done;
 
   SimpleRestServerCallback_t Callback;
 
@@ -105,7 +106,7 @@ private:
   }
 
 public:
-  clsSimpleRestServer(const char *_address, uint16_t _port, int _threadCount) {
+  clsSimpleRestServer(const char *_address, uint16_t _port, int _threadCount) : Done(false) {
     this->Address = _address;
     this->Port = _port;
     this->ThreadCount = _threadCount;
@@ -113,6 +114,7 @@ public:
 
   void setCallback(SimpleRestServerCallback_t _callback) { this->Callback = _callback; }
 
+  void stop() { this->Done = true; }
   void start();
 
 public:

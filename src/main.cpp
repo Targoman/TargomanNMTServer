@@ -261,12 +261,15 @@ private:
   Ptr<Vocab> trgVocab_;
 
   size_t numDevices_;
-  Ptr<BPE> bpe_;
+  std::vector<Ptr<BPE>> bpe_;
 
   std::vector<DeviceId> devices;
 
   Ptr<ThreadPool> threadPool_;
   std::atomic_long batchId;  
+
+  Ptr<BPE>& sourceBpe() { return this->bpe_.at(0); }
+  Ptr<BPE>& targetBpe() { return this->bpe_.size() < 2 ? this->bpe_.at(0) : this->bpe_.at(1); }
 
 public:
   virtual ~TranslateService() {}
@@ -296,7 +299,7 @@ public:
       std::vector<int> OutputWordIndexes;
       std::vector<std::string> OutputWords;
       EXTRA_DEBUG(std::cout << "Decoding BPE ..." << std::endl;)
-      std::tie(OutputWordIndexes, OutputWords) = this->bpe_->Decode(OutputWordsBpe);
+      std::tie(OutputWordIndexes, OutputWords) = this->targetBpe()->Decode(OutputWordsBpe);
       EXTRA_DEBUG(std::cout << "Getting soft alignment ...  " << _wordCount << ":" << OutputWordIndexes.size() << std::endl;)
 #if (PROJECT_VERSION_MAJOR < 1) || (PROJECT_VERSION_MINOR < 9)
       data::SoftAlignment RawAlignment = Hypothesis->TracebackAlignment();
@@ -343,9 +346,12 @@ public:
   void init() {
     // initialize vocabs
 
-    this->bpe_ = nullptr;
-    if(options_->get<std::string>("bpe_file").size() > 0)
-      this->bpe_ = New<BPE>(options_->get<std::string>("bpe_file"), "@@");
+    this->bpe_.resize(options_->get<std::vector<std::string>>("bpe_file").size());
+    if(this->bpe_.size() > 0) {
+      const std::vector<std::string>& BpeFilePaths = options_->get<std::vector<std::string>>("bpe_file");
+      for(size_t i = 0; i < this->bpe_.size(); ++i)
+        this->bpe_[i] = New<BPE>(BpeFilePaths.at(0), "@@");
+    }
 
     auto vocabPaths = options_->get<std::vector<std::string>>("vocabs");
     std::vector<int> maxVocabs = options_->get<std::vector<int>>("dim-vocabs");
@@ -489,7 +495,7 @@ public:
       std::vector<int> LineWordIndexes;
       for(size_t TokenIndex = 0; TokenIndex < LineTokens.size(); ++TokenIndex) {
         const auto& Token = LineTokens[TokenIndex];
-        auto Parts = this->bpe_->Encode(Token);
+        auto Parts = this->sourceBpe()->Encode(Token);
         for(const auto& Part : Parts) {
           auto Word_ = this->srcVocabs_[0]->operator[](Part);
           LineWords.push_back(Word_);
@@ -690,11 +696,11 @@ int main(int argc, char* argv[]) {
 
 #if (PROJECT_VERSION_MAJOR > 1) || (PROJECT_VERSION_MINOR > 7)
   ConfigParser Parser(cli::mode::translation);
-  Parser.addOption<std::string>(
+  Parser.addOption<std::vector<std::string>>(
     "--bpe_file",
     "General options",
-    "Path to bpe model for use with tokenization of input string",
-    "");
+    "Path to bpe model for use with tokenization of input and output strings",
+    {});
   Parser.addOption<bool>(
     "--extra_debug",
     "General options",
@@ -709,13 +715,17 @@ int main(int argc, char* argv[]) {
 #else
   if(true) {
     std::vector<char*> filtered_args;
-    std::string bpeFile = "", serverName = "";
+    std::string serverName = "";
+    std::vector<std::string> bpeFilePaths;
     bool extraDebug = false;
     int argIndex = 0;
     while(argIndex < argc) {
       if(strcmp(argv[argIndex], "--bpe_file") == 0) {
         ++argIndex;
-        bpeFile = argIndex < argc ? argv[argIndex] : "";
+	while(argIndex < argc && argv[argIndex][0] != '-') {
+	  bpeFilePaths.push_back(argv[argIndex]);
+          ++argIndex;
+	}
       } else if(strcmp(argv[argIndex], "--server_name") == 0) {
         ++argIndex;
         serverName = argIndex < argc ? argv[argIndex] : "";
@@ -731,7 +741,7 @@ int main(int argc, char* argv[]) {
       cli::mode::translation,
       true);
     CommandLineOptions->set("extra_debug", extraDebug);
-    CommandLineOptions->set("bpe_file", bpeFile);
+    CommandLineOptions->set("bpe_file", std::move(bpeFilePaths));
     CommandLineOptions->set("server_name", serverName);
   }
 #endif
@@ -747,7 +757,7 @@ int main(int argc, char* argv[]) {
   TranslateService<BeamSearch> TranslationService(Options);
 
   clsSimpleRestServer Server("0.0.0.0", 8080, 16);
-  if(Options->get<std::string>("bpe_file").size() > 0) {
+  if(Options->get<std::vector<std::string>>("bpe_file").size() > 0) {
     Server.setCallback([&](const clsSimpleRestRequest& _request, clsSimpleRestResponse& _response) {
       std::vector<std::string> Sentences;
       std::vector<int> LineNumbers;
