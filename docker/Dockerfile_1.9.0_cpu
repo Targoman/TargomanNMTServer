@@ -1,0 +1,12 @@
+FROM ubuntu:jammy-20220404
+
+ENV LD_LIBRARY_PATH=/
+COPY files_1.9.0_cpu/* /
+RUN mkdir /model
+VOLUME /model
+WORKDIR /model
+ENTRYPOINT ["/TargomanNMTServer"]
+CMD ["-c", "./model.npz.decoder.yml", "--bpe_file", "./subwords.bpe"]
+
+EXPOSE 8080
+

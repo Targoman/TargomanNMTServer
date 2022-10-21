@@ -4,6 +4,7 @@
 Makefile
 out
 libmarian
+docker/files_1.9.0_cpu
 
 # Prerequisites
 *.d
